@@ -76,6 +76,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UnsupportedEncodingException;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -369,7 +370,7 @@ public class FSMountPoint implements MountPoint {
         if (!virtualFile.exists()) {
             throw new NotFoundException(String.format("Object '%s' does not exists. ", vfsPath));
         }
-        if (!hasPermission(virtualFile, BasicPermissions.READ, true)) {
+        if (!hasPermission(virtualFile, BasicPermissions.READ, true, false)) {
             throw new ForbiddenException(String.format("Unable get item '%s'. Operation not permitted. ", virtualFile.getPath()));
         }
         return virtualFile;
@@ -436,13 +437,22 @@ public class FSMountPoint implements MountPoint {
             return null;
         }
         final Path childPath = parent.getVirtualFilePath().newPath(name);
+        
+        // Find the last existing parent path (the actual parent of the requested file) and check permissions on it
+        VirtualFileImpl actualParentFile = getLastExistingParent(parent, name);
+        if (!hasPermission(actualParentFile, BasicPermissions.READ, true)) {
+            throw new ForbiddenException(String.format("Unable get item '%s'. Operation not permitted. ", childPath));
+        }
+        if (isRecursiveSymbolicLink(actualParentFile)) {
+        	return null;
+         }
         final VirtualFileImpl child = new VirtualFileImpl(new java.io.File(parent.getIoFile(), name), childPath, pathToId(childPath), this);
         if (child.exists()) {
             if (systemFilter.accept(workspaceId, child.getVirtualFilePath())) {
                 // Don't check permissions for file "misc.xml" in folder ".codenvy". Dirty huck :( but seems simplest solution for now.
                 // Need to work with 'misc.xml' independently to user.
-                if (!hasPermission(child, BasicPermissions.READ, true)) {
-                    throw new ForbiddenException(String.format("Unable get item '%s'. Operation not permitted. ", child.getPath()));
+                if (!hasPermission(child, BasicPermissions.READ, true, false)) {
+                   throw new ForbiddenException(String.format("Unable get item '%s'. Operation not permitted. ", child.getPath()));
                 }
             }
             return child;
@@ -451,26 +461,45 @@ public class FSMountPoint implements MountPoint {
         return null;
     }
 
+    private VirtualFileImpl getLastExistingParent(VirtualFileImpl parent, String name) {
+        Path currentPath = parent.getVirtualFilePath();
+        VirtualFileImpl actualParentFile = parent;
+        // Go over all the parents of this file
+        final Path path = Path.fromString(name).getParent();
+        if (path == null) {
+            return actualParentFile;
+        }
+        for (String element : path.elements()) {
+            currentPath = currentPath.newPath(element);
+            java.io.File currentIoFile = new java.io.File(ioRoot, toIoPath(currentPath));
+            if (currentIoFile.exists()) {
+                actualParentFile = new VirtualFileImpl(currentIoFile, currentPath, pathToId(currentPath), this);
+            } else {
+                break;
+            }
+        }
+        return actualParentFile;
+    }
+
 
     LazyIterator<VirtualFile> getChildren(VirtualFileImpl parent, VirtualFileFilter filter) throws ServerException {
         if (!parent.isFolder()) {
             return LazyIterator.emptyIterator();
         }
-
-        if (parent.isRoot()) {
-            // NOTE: We do not check read permissions when access to ROOT folder.
-            if (!hasPermission(parent, BasicPermissions.READ, false)) {
-                // User has not access to ROOT folder.
-                return LazyIterator.emptyIterator();
-            }
+        // Check permissions to read the folder. In case of symbolic link we have to check the target even if it's not
+        // the root folder.
+        if (!hasPermission(parent, BasicPermissions.READ, true)) {
+            // User has not access to ROOT folder.
+            return LazyIterator.emptyIterator();
         }
+
         final List<VirtualFile> children = doGetChildren(parent, SERVICE_DIR_FILTER);
         for (Iterator<VirtualFile> iterator = children.iterator(); iterator.hasNext(); ) {
             VirtualFile child = iterator.next();
             // Check permission directly for current file only.
             // We know the parent is accessible for current user otherwise we should not be here.
-            if (!hasPermission((VirtualFileImpl)child, BasicPermissions.READ, false) || !filter.accept(child)) {
-                iterator.remove(); // Do not show item in list if current user has not permission to see it
+            if (!hasPermission((VirtualFileImpl)child, BasicPermissions.READ, false, false) || !filter.accept(child)) {
+               iterator.remove(); // Do not show item in list if current user has not permission to see it
             }
         }
         // Always sort to get the exact same order of files for each listing.
@@ -479,8 +508,12 @@ public class FSMountPoint implements MountPoint {
     }
 
 
+    
     private List<VirtualFile> doGetChildren(VirtualFileImpl virtualFile, java.io.FilenameFilter filter) throws ServerException {
-        final String[] names = virtualFile.getIoFile().list(filter);
+    	if (isRecursiveSymbolicLink(virtualFile)) {
+    		return Collections.emptyList();
+    	}         
+     	final String[] names = virtualFile.getIoFile().list(filter);
         if (names == null) {
             // Something wrong. According to java docs may be null only if i/o error occurs.
             throw new ServerException(String.format("Unable get children '%s'. ", virtualFile.getPath()));
@@ -501,16 +534,19 @@ public class FSMountPoint implements MountPoint {
         if (!parent.isFolder()) {
             throw new ForbiddenException("Unable create new file. Item specified as parent is not a folder. ");
         }
-
+        
         final Path newPath = parent.getVirtualFilePath().newPath(name);
+        final java.io.File newIoFile = new java.io.File(ioRoot, toIoPath(newPath));
+        
+        // Don't check permissions when create file "misc.xml" in folder ".codenvy". Dirty huck :( but seems simplest solution for now.
+        // Need to work with 'misc.xml' independently to user.
         if (systemFilter.accept(workspaceId, newPath)) {
-            // Don't check permissions when create file "misc.xml" in folder ".codenvy". Dirty huck :( but seems simplest solution for now.
-            // Need to work with 'misc.xml' independently to user.
-            if (!hasPermission(parent, BasicPermissions.WRITE, true)) {
-                throw new ForbiddenException(String.format("Unable create new file in '%s'. Operation not permitted. ", parent.getPath()));
+            VirtualFileImpl actualParentFile = getLastExistingParent(parent, name);
+            if (!hasPermission(actualParentFile, BasicPermissions.WRITE, true)) {
+                throw new ForbiddenException(String.format("Unable create new file in '%s'. Operation not permitted. ", actualParentFile.getPath()));
             }
         }
-        final java.io.File newIoFile = new java.io.File(ioRoot, toIoPath(newPath));
+        
         try {
             if (!newIoFile.createNewFile()) { // atomic
                 throw new ConflictException(String.format("Item '%s' already exists. ", newPath));
@@ -545,20 +581,31 @@ public class FSMountPoint implements MountPoint {
         if (!parent.isFolder()) {
             throw new ForbiddenException("Unable create folder. Item specified as parent is not a folder. ");
         }
-
-        if (!hasPermission(parent, BasicPermissions.WRITE, true)) {
-            throw new ForbiddenException(
-                    String.format("Unable create new folder in '%s'. Operation not permitted. ", parent.getPath()));
-        }
         // Name may be hierarchical, e.g. folder1/folder2/folder3.
         // Some folder in hierarchy may already exists but at least one folder must be created.
         // If no one folder created then ItemAlreadyExistException is thrown.
         Path currentPath = parent.getVirtualFilePath();
         Path newPath = null;
         java.io.File newIoFile = null;
+        boolean foundParent = false;
+        VirtualFileImpl actualParentFile = parent; // Last existing folder in the path
         for (String element : Path.fromString(name).elements()) {
             currentPath = currentPath.newPath(element);
             java.io.File currentIoFile = new java.io.File(ioRoot, toIoPath(currentPath));
+            
+            // Check permissions if we found the last existing parent in the path
+            if (!foundParent) {
+                if (currentIoFile.exists()) {
+                    actualParentFile = new VirtualFileImpl(currentIoFile, currentPath, pathToId(currentPath), this);
+                } else {
+                    if (!hasPermission(actualParentFile, BasicPermissions.WRITE.value(), true)) {
+                        throw new ForbiddenException(
+                                String.format("Unable create new folder in '%s'. Operation not permitted. ", actualParentFile.getPath()));
+                    }
+                    foundParent = true;
+                }
+            }
+            
             if (currentIoFile.mkdir()) {
                 newPath = currentPath;
                 newIoFile = currentIoFile;
@@ -605,8 +652,8 @@ public class FSMountPoint implements MountPoint {
         if (!parent.isFolder()) {
             throw new ForbiddenException("Unable copy item. Item specified as parent is not a folder. ");
         }
-        if (!hasPermission(parent, BasicPermissions.WRITE, true)) {
-            throw new ForbiddenException(String.format("Unable copy item '%s' to %s. Operation not permitted. ",
+       if (!hasPermission(parent, BasicPermissions.WRITE, true) || !hasPermission(source, BasicPermissions.READ, true)) {
+           throw new ForbiddenException(String.format("Unable copy item '%s' to %s. Operation not permitted. ",
                                                        source.getPath(), parent.getPath()));
         }
         String newName = nullToEmpty(name).trim().isEmpty() ? source.getName() : name;
@@ -645,7 +692,11 @@ public class FSMountPoint implements MountPoint {
                 final LinkedList<VirtualFile> q = new LinkedList<>();
                 q.add(source);
                 while (!q.isEmpty()) {
-                    for (VirtualFile current : doGetChildren((VirtualFileImpl)q.pop(), SERVICE_GIT_DIR_FILTER)) {
+                    final VirtualFileImpl currFolder = (VirtualFileImpl)q.pop();
+                    if (Files.isSymbolicLink(currFolder.getIoFile().toPath())) {
+                        continue;
+                    }
+                    for (VirtualFile current : doGetChildren(currFolder, SERVICE_GIT_DIR_FILTER)) {
                         // Check permission directly for current file only.
                         // We already know parent accessible for current user otherwise we should not be here.
                         // Ignore item if don't have permission to read it.
@@ -697,7 +748,7 @@ public class FSMountPoint implements MountPoint {
         } catch (IOException e) {
             // Do nothing for file tree. Let client side decide what to do.
             // User may delete copied files (if any) and try copy again.
-            String msg = String.format("Unable copy '%s' to '%s'. ", source, destination);
+            String msg = String.format("Unable copy '%s' to '%s'. ", source.getPath(), destination.getPath());
             LOG.error(msg + e.getMessage(), e); // More details in log but do not show internal error to caller.
             throw new ServerException(msg);
         }
@@ -845,6 +896,15 @@ public class FSMountPoint implements MountPoint {
         if (!virtualFile.isFile()) {
             throw new ForbiddenException(String.format("Unable get content. Item '%s' is not a file. ", virtualFile.getPath()));
         }
+        
+        if (systemFilter.accept(workspaceId, virtualFile.getVirtualFilePath())) {
+            // Don't check permissions when update file ".codenvy/misc.xml". Dirty huck :( but seems simplest solution for now.
+            // Need to work with 'misc.xml' independently to user.
+            if (!hasPermission(virtualFile, BasicPermissions.READ, true)) {
+                throw new ForbiddenException(
+                        String.format("Unable get content of file '%s'. Operation not permitted. ", virtualFile.getPath()));
+            }
+        }
 
         try (PathLockFactory.PathLock lock = acquireLock(virtualFile, false)) {
             final java.io.File ioFile = virtualFile.getIoFile();
@@ -892,6 +952,20 @@ public class FSMountPoint implements MountPoint {
         updateContent(virtualFile, null, content, lockToken, false);
     }
 
+    private boolean isPathUnderServiceDir(String pathStr)
+    {
+        java.nio.file.Path path = java.nio.file.Paths.get(pathStr);
+        Iterator<java.nio.file.Path> pathIterator = path.iterator();
+        while (pathIterator.hasNext()) {
+            java.nio.file.Path subPath = pathIterator.next();
+            if (subPath.getFileName().toString().equals(SERVICE_DIR))
+            {
+                return true;
+            }
+        }
+        
+        return false;
+    }
 
     private void updateContent(VirtualFileImpl virtualFile, String mediaType, InputStream content, String lockToken,
                                boolean updateMediaType) throws ForbiddenException, ServerException {
@@ -967,7 +1041,7 @@ public class FSMountPoint implements MountPoint {
         }
         final String myPath = virtualFile.getPath();
         final boolean folder = virtualFile.isFolder();
-        if (!hasPermission(virtualFile, BasicPermissions.WRITE, true)) {
+        if (!hasPermission(virtualFile, BasicPermissions.WRITE, true, false)) {
             throw new ForbiddenException(String.format("Unable delete item '%s'. Operation not permitted. ", myPath));
         }
         if (virtualFile.isFile() && !validateLockTokenIfLocked(virtualFile, lockToken)) {
@@ -983,10 +1057,14 @@ public class FSMountPoint implements MountPoint {
             final LinkedList<VirtualFile> q = new LinkedList<>();
             q.add(virtualFile);
             while (!q.isEmpty()) {
-                for (VirtualFile child : doGetChildren((VirtualFileImpl)q.pop(), SERVICE_GIT_DIR_FILTER)) {
+                final VirtualFileImpl currFolder = (VirtualFileImpl)q.pop();
+                if (Files.isSymbolicLink(currFolder.getIoFile().toPath())) {
+                    continue;
+                }
+                for (VirtualFile child : doGetChildren(currFolder, SERVICE_GIT_DIR_FILTER)) {
                     // Check permission directly for current file only.
                     // We already know parent may be deleted by current user otherwise we should not be here.
-                    if (!hasPermission((VirtualFileImpl)child, BasicPermissions.WRITE, false)) {
+                   if (!hasPermission((VirtualFileImpl)child, BasicPermissions.WRITE, false, false)) {
                         throw new ForbiddenException(String.format("Unable delete item '%s'. Operation not permitted. ", child.getPath()));
                     }
                     if (child.isFolder()) {
@@ -1016,7 +1094,7 @@ public class FSMountPoint implements MountPoint {
 
         final String path = virtualFile.getPath();
         boolean isFile = virtualFile.isFile();
-        if (!deleteRecursive(virtualFile.getIoFile())) {
+        if (!deleteRecursive(virtualFile.getIoFile(), false)) {
             LOG.error("Unable delete file {}", virtualFile.getIoFile());
             throw new ServerException(String.format("Unable delete item '%s'. ", path));
         }
@@ -1074,6 +1152,12 @@ public class FSMountPoint implements MountPoint {
         if (!virtualFile.isFolder()) {
             throw new ForbiddenException(String.format("Unable export to zip. Item '%s' is not a folder. ", virtualFile.getPath()));
         }
+        
+        // Check permissions to read the folder. In case of symbolic link we have to check the target.
+        if (!hasPermission(virtualFile, BasicPermissions.READ, true)) {
+            throw new ForbiddenException(String.format("Unable export item '%s' to zip. Operation not permitted. ", virtualFile.getPath()));
+        }
+
         java.io.File zipFile = null;
         FileOutputStream out = null;
         try {
@@ -1085,7 +1169,11 @@ public class FSMountPoint implements MountPoint {
             final int zipEntryNameTrim = virtualFile.getVirtualFilePath().length();
             final byte[] buff = new byte[COPY_BUFFER_SIZE];
             while (!q.isEmpty()) {
-                for (VirtualFile current : doGetChildren((VirtualFileImpl)q.pop(), SERVICE_GIT_DIR_FILTER)) {
+                final VirtualFileImpl currFolder = (VirtualFileImpl)q.pop();
+                if (Files.isSymbolicLink(currFolder.getIoFile().toPath())) {
+                   continue;
+                }
+                for (VirtualFile current : doGetChildren(currFolder, SERVICE_GIT_DIR_FILTER)) {
                     // (1) Check filter.
                     // (2) Check permission directly for current file only.
                     // We already know parent accessible for current user otherwise we should not be here.
@@ -1240,7 +1328,7 @@ public class FSMountPoint implements MountPoint {
             throw new ForbiddenException(String.format("Unable lock '%s'. Locking allowed for files only. ", virtualFile.getPath()));
         }
 
-        if (!hasPermission(virtualFile, BasicPermissions.WRITE, true)) {
+        if (!hasPermission(virtualFile, BasicPermissions.WRITE, true, false)) {
             throw new ForbiddenException(String.format("Unable lock '%s'. Operation not permitted. ", virtualFile.getPath()));
         }
         return doLock(virtualFile, timeout);
@@ -1367,7 +1455,7 @@ public class FSMountPoint implements MountPoint {
         final int index = virtualFile.getVirtualFilePath().hashCode() & MASK;
         final AccessControlList actualACL = aclCache[index].get(virtualFile.getVirtualFilePath());
 
-        if (!hasPermission(virtualFile, BasicPermissions.UPDATE_ACL, true)) {
+       if (!hasPermission(virtualFile, BasicPermissions.UPDATE_ACL, true, false)) {
             throw new ForbiddenException(String.format("Unable update ACL for '%s'. Operation not permitted. ", virtualFile.getPath()));
         }
 
@@ -1415,11 +1503,62 @@ public class FSMountPoint implements MountPoint {
 
         eventService.publish(new UpdateACLEvent(workspaceId, virtualFile.getPath(), virtualFile.isFolder()));
     }
-
-
+    
+    private java.nio.file.Path getPath(VirtualFileImpl file, boolean followSymbolicLink) throws IOException {
+        if (followSymbolicLink) {
+            return file.getIoFile().getCanonicalFile().toPath();
+        } else {
+            // We need to resolve the links up to the parent folder and add this file's name at the end
+            final File ioFile = file.getIoFile();
+            final File parentFile = ioFile.getParentFile();
+            if (parentFile == null) { // root
+                return ioFile.toPath();
+            }
+            return parentFile.getCanonicalFile().toPath().resolve(ioFile.getName());
+        }
+    }
+ 
     protected boolean hasPermission(VirtualFileImpl virtualFile, BasicPermissions p, boolean checkParent) {
-        // Find the closes access control list on the line of ancestry, starting with the virtual file itself
+    	return hasPermission(virtualFile, p, checkParent, true);
+    }
+    private boolean hasPermission(VirtualFileImpl virtualFile, BasicPermissions p, boolean checkParent, boolean followSymbolicLink) {
         Path path = virtualFile.getVirtualFilePath();
+        if (followSymbolicLink && !Files.isSymbolicLink(virtualFile.getIoFile().toPath())) {
+            followSymbolicLink = false;
+        }
+
+        // In case of a symbolic link or other non-canonical path, check the target file and make sure it's under the same mount point
+        try {
+            // getCanonicalFile returns a file that points to the actual file (in case of symbolic link it's the target file)
+            final java.nio.file.Path ioFilePath = getPath(virtualFile, followSymbolicLink);
+            final java.nio.file.Path rootPath = getPath(getRoot(), followSymbolicLink);
+            // Check it's under this mount point
+            if (!ioFilePath.startsWith(rootPath)) {
+                return false;
+            }
+
+            // Get the relative path
+            final java.nio.file.Path relativePath = rootPath.relativize(ioFilePath);
+            path = Path.fromString(relativePath.toString());
+        } catch (IOException e){
+            // Either the root file or the target file cannot be read
+            LOG.error("Unable to check permissions on file", e);
+            return false;
+        }
+
+        boolean hasPermission = hasPermission(path, p, checkParent);
+        if (hasPermission && followSymbolicLink) {
+            // Check original file permissions
+            hasPermission = hasPermission(virtualFile, p, checkParent, false);
+        }
+        return hasPermission;
+    }      
+    protected boolean hasPermission(Path path, BasicPermissions p, boolean checkParent) {   
+        // Check Illegal access to file in service dir
+        if (isPathUnderServiceDir(path.toString())) {
+            return false;
+        }
+
         AccessControlList accessControlList;
         while (true) {
             if (path == null) {
@@ -1456,7 +1595,23 @@ public class FSMountPoint implements MountPoint {
         aclCheck = aclPermission(VirtualFileSystemInfo.ANY_PRINCIPAL, Principal.Type.USER, accessControlList, p);
         return aclCheck != null && aclCheck;
     }
-
+    private boolean isRecursiveSymbolicLink(VirtualFileImpl file) {
+        if (!Files.isSymbolicLink(file.getIoFile().toPath())) {
+            return false;
+        }
+        try {
+            // File /a1/a2/a3 is a recursive symbolic link if it points to /, /a1 or /a1/a2 (or /a1/a2/a3 if it's possible).
+            // In other words, the file is inside its target.
+            java.nio.file.Path filePath = getPath(file, false);
+            java.nio.file.Path targetPath = getPath(file, true);
+            return filePath.equals(targetPath) || filePath.startsWith(targetPath);
+        } catch (IOException e) {
+            // Either the file or its target cannot be read
+            LOG.error("Unable to check if file is recursive symbolic link", e);
+            return false;
+        }
+    }
+    
     /**
      * Check whether the given principal has a required permission in an ACL.
      */
@@ -1499,7 +1654,7 @@ public class FSMountPoint implements MountPoint {
     void updateProperties(VirtualFileImpl virtualFile, List<Property> properties, String lockToken)
             throws ForbiddenException, ServerException {
         final int index = virtualFile.getVirtualFilePath().hashCode() & MASK;
-        if (!hasPermission(virtualFile, BasicPermissions.WRITE, true)) {
+        if (!hasPermission(virtualFile, BasicPermissions.WRITE, true, false)) {
             throw new ForbiddenException(
                     String.format("Unable update properties for '%s'. Operation not permitted. ", virtualFile.getPath()));
         }
